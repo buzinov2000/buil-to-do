@@ -16,6 +16,7 @@ import database
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = 108117608
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -53,7 +54,11 @@ def build_keyboard(message_id: int, items: list[dict]) -> InlineKeyboardMarkup |
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
-@dp.message(Command("start"))
+def owner_only(message: Message) -> bool:
+    return message.from_user.id == OWNER_ID
+
+
+@dp.message(Command("start"), owner_only)
 async def cmd_start(message: Message):
     await message.answer(
         "Привет\\! Отправь мне список задач — каждая строка отдельная задача\\.\n\n"
@@ -63,7 +68,7 @@ async def cmd_start(message: Message):
     )
 
 
-@dp.message(Command("clear"))
+@dp.message(Command("clear"), owner_only)
 async def cmd_clear(message: Message):
     result = await database.get_last_active(message.chat.id)
     if result is None:
@@ -86,7 +91,7 @@ async def cmd_clear(message: Message):
     await message.answer("Кнопки убраны\\.", parse_mode="MarkdownV2")
 
 
-@dp.message(F.text)
+@dp.message(F.text, owner_only)
 async def handle_task_list(message: Message):
     lines = [line.strip() for line in message.text.splitlines() if line.strip()]
     if not lines:
@@ -118,7 +123,7 @@ async def handle_task_list(message: Message):
         pass
 
 
-@dp.callback_query(F.data.startswith("done:"))
+@dp.callback_query(F.data.startswith("done:"), lambda c: c.from_user.id == OWNER_ID)
 async def handle_done(callback: CallbackQuery):
     _, msg_id_str, index_str = callback.data.split(":")
     msg_id = int(msg_id_str)
