@@ -112,6 +112,11 @@ async def handle_task_list(message: Message):
         reply_markup=keyboard,
     )
 
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
 
 @dp.callback_query(F.data.startswith("done:"))
 async def handle_done(callback: CallbackQuery):
