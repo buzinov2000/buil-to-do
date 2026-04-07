@@ -1,0 +1,20 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 38.180.200.88
+          username: petrick
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ~/task-bot
+            git pull origin main
+            docker compose up -d --build
