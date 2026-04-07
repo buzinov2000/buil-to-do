@@ -5,6 +5,7 @@ import re
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -155,6 +156,10 @@ async def main():
     import pathlib
     pathlib.Path("data").mkdir(exist_ok=True)
     await database.init_db()
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Справка"),
+        BotCommand(command="clear", description="Убрать кнопки с последнего списка"),
+    ])
     await dp.start_polling(bot)
 
 
