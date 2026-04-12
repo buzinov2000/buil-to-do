@@ -11,6 +11,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    User,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -19,7 +20,10 @@ import database
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = 108117608
+ALLOWED_IDS: set[int] = {
+    int(x) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip().isdigit()
+}
+BOT_USERNAME: str = ""
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -27,7 +31,8 @@ dp = Dispatcher()
 log = logging.getLogger(__name__)
 
 # In-memory store for pending tasks awaiting user choice (add/new)
-pending_tasks: dict[int, list[dict]] = {}
+# Keys: chat_id, values: dict with "items" and "author"
+pending_tasks: dict[int, dict] = {}
 
 # Characters that must be escaped in MarkdownV2
 _MD_SPECIAL = r"\_*[]()~`>#+-=|{}.!"
@@ -35,6 +40,40 @@ _MD_SPECIAL = r"\_*[]()~`>#+-=|{}.!"
 
 def escape_md(text: str) -> str:
     return re.sub(r"([" + re.escape(_MD_SPECIAL) + r"])", r"\\\1", text)
+
+
+def get_display_name(user: User) -> str:
+    return user.first_name or user.username or "?"
+
+
+def allowed_user(message: Message) -> bool:
+    return message.from_user.id in ALLOWED_IDS
+
+
+def allowed_callback(callback: CallbackQuery) -> bool:
+    return callback.from_user.id in ALLOWED_IDS
+
+
+def extract_task_text(message: Message) -> str | None:
+    """Extract task text from a message.
+
+    Private chat: return full text.
+    Group chat: return text only if @bot is mentioned, with @mention stripped.
+    """
+    if message.chat.type == "private":
+        return message.text
+
+    # Group/supergroup — require @mention
+    if not message.text or not BOT_USERNAME:
+        return None
+
+    mention = f"@{BOT_USERNAME}"
+    if mention.lower() not in message.text.lower():
+        return None
+
+    # Remove the @mention from text
+    cleaned = re.sub(re.escape(mention), "", message.text, flags=re.IGNORECASE).strip()
+    return cleaned if cleaned else None
 
 
 def parse_tasks(text: str) -> list[dict]:
@@ -55,14 +94,17 @@ def parse_tasks(text: str) -> list[dict]:
     return items
 
 
-def build_message(items: list[dict]) -> str:
+def build_message(items: list[dict], created_by: str = "") -> str:
     today = [t for t in items if t.get("section", "today") == "today"]
     tomorrow = [t for t in items if t.get("section") == "tomorrow"]
 
     has_today_active = any(not t["done"] for t in today)
     has_tomorrow_active = any(not t["done"] for t in tomorrow)
 
-    lines = ["📋 *Задачи*\n"]
+    if created_by:
+        lines = [f"📋 *Задачи от {escape_md(created_by)}*\n"]
+    else:
+        lines = ["📋 *Задачи*\n"]
 
     if has_today_active:
         lines.append("*— Сегодня —*")
@@ -72,7 +114,9 @@ def build_message(items: list[dict]) -> str:
             label = escape_md(task["text"])
             idx = items.index(task) + 1
             if task["done"]:
-                lines.append(f"✅ ~{idx}\\. {label}~")
+                done_by = task.get("done_by", "")
+                suffix = f" \\({escape_md(done_by)}\\)" if done_by else ""
+                lines.append(f"✅ ~{idx}\\. {label}~{suffix}")
             else:
                 lines.append(f"◻️ {idx}\\. {label}")
         lines.append("")
@@ -85,7 +129,9 @@ def build_message(items: list[dict]) -> str:
             label = escape_md(task["text"])
             idx = items.index(task) + 1
             if task["done"]:
-                lines.append(f"✅ ~{idx}\\. {label}~")
+                done_by = task.get("done_by", "")
+                suffix = f" \\({escape_md(done_by)}\\)" if done_by else ""
+                lines.append(f"✅ ~{idx}\\. {label}~{suffix}")
             else:
                 lines.append(f"◻️ {idx}\\. {label}")
 
@@ -106,11 +152,7 @@ def build_keyboard(message_id: int, items: list[dict]) -> InlineKeyboardMarkup |
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
-def owner_only(message: Message) -> bool:
-    return message.from_user.id == OWNER_ID
-
-
-@dp.message(Command("start"), owner_only)
+@dp.message(Command("start"), allowed_user)
 async def cmd_start(message: Message):
     await message.answer(
         "Привет\\! Отправь мне список задач — каждая строка отдельная задача\\.\n\n"
@@ -121,15 +163,15 @@ async def cmd_start(message: Message):
     )
 
 
-@dp.message(Command("clear"), owner_only)
+@dp.message(Command("clear"), allowed_user)
 async def cmd_clear(message: Message):
     result = await database.get_last_active(message.chat.id)
     if result is None:
         await message.answer("Активных списков нет\\.", parse_mode="MarkdownV2")
         return
 
-    msg_id, items = result
-    text = build_message(items) + "\n\n_\\(сброшено\\)_"
+    msg_id, items, created_by = result
+    text = build_message(items, created_by) + "\n\n_\\(сброшено\\)_"
     try:
         await bot.edit_message_text(
             chat_id=message.chat.id,
@@ -144,17 +186,22 @@ async def cmd_clear(message: Message):
     await message.answer("Кнопки убраны\\.", parse_mode="MarkdownV2")
 
 
-@dp.message(F.text, owner_only)
+@dp.message(F.text, allowed_user)
 async def handle_task_list(message: Message):
-    new_items = parse_tasks(message.text)
+    task_text = extract_task_text(message)
+    if task_text is None:
+        return
+
+    new_items = parse_tasks(task_text)
     if not new_items:
         return
 
+    author = get_display_name(message.from_user)
     active = await database.get_last_active(message.chat.id)
 
     if active is not None:
         # Store pending tasks and ask the user
-        pending_tasks[message.chat.id] = new_items
+        pending_tasks[message.chat.id] = {"items": new_items, "author": author}
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="➕ Добавить к текущему", callback_data="add_to_existing"),
             InlineKeyboardButton(text="🆕 Новый список", callback_data="new_list"),
@@ -171,7 +218,7 @@ async def handle_task_list(message: Message):
         return
 
     # No active list — create a new one
-    await _create_new_list(message.chat.id, new_items)
+    await _create_new_list(message.chat.id, new_items, created_by=author)
 
     try:
         await message.delete()
@@ -179,9 +226,9 @@ async def handle_task_list(message: Message):
         pass
 
 
-async def _create_new_list(chat_id: int, items: list[dict]) -> None:
+async def _create_new_list(chat_id: int, items: list[dict], created_by: str = "") -> None:
     """Send a new task list message and save to DB."""
-    text = build_message(items)
+    text = build_message(items, created_by)
     sent = await bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -189,7 +236,7 @@ async def _create_new_list(chat_id: int, items: list[dict]) -> None:
         reply_markup=build_keyboard(0, items),
     )
     keyboard = build_keyboard(sent.message_id, items)
-    await database.save_tasks(chat_id, sent.message_id, items)
+    await database.save_tasks(chat_id, sent.message_id, items, created_by)
     await bot.edit_message_reply_markup(
         chat_id=chat_id,
         message_id=sent.message_id,
@@ -197,11 +244,11 @@ async def _create_new_list(chat_id: int, items: list[dict]) -> None:
     )
 
 
-@dp.callback_query(F.data == "add_to_existing", lambda c: c.from_user.id == OWNER_ID)
+@dp.callback_query(F.data == "add_to_existing", allowed_callback)
 async def handle_add_to_existing(callback: CallbackQuery):
     chat_id = callback.message.chat.id
-    new_items = pending_tasks.pop(chat_id, None)
-    if new_items is None:
+    pending = pending_tasks.pop(chat_id, None)
+    if pending is None:
         await callback.answer("Нет ожидающих задач.")
         return
 
@@ -210,10 +257,10 @@ async def handle_add_to_existing(callback: CallbackQuery):
         await callback.answer("Активный список не найден.")
         return
 
-    msg_id, _ = active
-    items = await database.append_tasks(chat_id, msg_id, new_items)
+    msg_id, _, created_by = active
+    items = await database.append_tasks(chat_id, msg_id, pending["items"])
 
-    text = build_message(items)
+    text = build_message(items, created_by)
     keyboard = build_keyboard(msg_id, items)
     await bot.edit_message_text(
         chat_id=chat_id,
@@ -231,15 +278,15 @@ async def handle_add_to_existing(callback: CallbackQuery):
     await callback.answer("Задачи добавлены.")
 
 
-@dp.callback_query(F.data == "new_list", lambda c: c.from_user.id == OWNER_ID)
+@dp.callback_query(F.data == "new_list", allowed_callback)
 async def handle_new_list(callback: CallbackQuery):
     chat_id = callback.message.chat.id
-    new_items = pending_tasks.pop(chat_id, None)
-    if new_items is None:
+    pending = pending_tasks.pop(chat_id, None)
+    if pending is None:
         await callback.answer("Нет ожидающих задач.")
         return
 
-    await _create_new_list(chat_id, new_items)
+    await _create_new_list(chat_id, pending["items"], created_by=pending["author"])
 
     # Delete the service message
     try:
@@ -249,19 +296,22 @@ async def handle_new_list(callback: CallbackQuery):
     await callback.answer("Новый список создан.")
 
 
-@dp.callback_query(F.data.startswith("done:"), lambda c: c.from_user.id == OWNER_ID)
+@dp.callback_query(F.data.startswith("done:"), allowed_callback)
 async def handle_done(callback: CallbackQuery):
     _, msg_id_str, index_str = callback.data.split(":")
     msg_id = int(msg_id_str)
     index = int(index_str)
 
-    items = await database.mark_done(callback.message.chat.id, msg_id, index)
+    done_by = get_display_name(callback.from_user)
+    items = await database.mark_done(callback.message.chat.id, msg_id, index, done_by)
     if items is None:
         await callback.answer("Задача не найдена.")
         return
 
+    created_by = await database.get_created_by(callback.message.chat.id, msg_id)
+
     all_done = all(t["done"] for t in items)
-    text = build_message(items)
+    text = build_message(items, created_by)
     if all_done:
         text += "\n\n🎉 *Всё готово\\!*"
 
@@ -280,8 +330,8 @@ async def handle_done(callback: CallbackQuery):
 async def midnight_shift():
     """Shift 'tomorrow' tasks to 'today' and update messages."""
     updated = await database.shift_tomorrow_to_today()
-    for chat_id, msg_id, items in updated:
-        text = build_message(items)
+    for chat_id, msg_id, items, created_by in updated:
+        text = build_message(items, created_by)
         all_done = all(t["done"] for t in items)
         if all_done:
             text += "\n\n🎉 *Всё готово\\!*"
@@ -299,9 +349,14 @@ async def midnight_shift():
 
 
 async def main():
+    global BOT_USERNAME
     import pathlib
     pathlib.Path("data").mkdir(exist_ok=True)
     await database.init_db()
+
+    me = await bot.get_me()
+    BOT_USERNAME = me.username or ""
+
     await bot.set_my_commands([
         BotCommand(command="start", description="Справка"),
         BotCommand(command="clear", description="Убрать кнопки с последнего списка"),

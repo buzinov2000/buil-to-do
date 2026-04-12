@@ -25,6 +25,7 @@
 
 ```
 BOT_TOKEN=
+ALLOWED_IDS=108117608,ID2,ID3
 ```
 
 ---
